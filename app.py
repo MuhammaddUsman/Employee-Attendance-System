@@ -70,6 +70,7 @@ BASE_TEMPLATE = r'''
 <html>
 <head>
     <title>Employee Attendance System</title>
+    <script defer src="https://cdn.vercel-insights.com/v1/script.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
