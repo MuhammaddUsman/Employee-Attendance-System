@@ -9,9 +9,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-
 app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_change_me')
-
 
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin')
 TIMEZONE = ZoneInfo(os.environ.get('TIMEZONE', 'Asia/Karachi'))
@@ -22,7 +20,10 @@ REDIS_URL = os.environ.get('KV_REST_API_URL') or os.environ.get('UPSTASH_REDIS_R
 REDIS_TOKEN = os.environ.get('KV_REST_API_TOKEN') or os.environ.get('UPSTASH_REDIS_REST_TOKEN')
 REDIS_KEY = 'attendance_data'
 DATA_FILE = os.path.join('/tmp' if os.environ.get('VERCEL') else '.', 'attendance_data.json')
-EMPTY = lambda: {'employees': {}, 'attendance': []}
+
+
+def EMPTY():
+    return {'employees': {}, 'attendance': []}
 
 
 def now_local():
@@ -42,11 +43,10 @@ def _redis(path, body=None):
 
 def load_data():
     if REDIS_URL and REDIS_TOKEN:
-        try:
-            raw = _redis(f'get/{REDIS_KEY}').get('result')
-            return json.loads(raw) if raw else EMPTY()
-        except Exception:
-            return EMPTY()
+        # No try/except on purpose: if Redis fails we want an error,
+        # not an empty list that would overwrite real data on the next save.
+        raw = _redis(f'get/{REDIS_KEY}').get('result')
+        return json.loads(raw) if raw else EMPTY()
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f:
             try:
@@ -511,7 +511,6 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
         {% if message %}
         <div class="success-msg">✓ {{ message }}</div>
         {% endif %}
-        {% if is_admin %}
         <form method="POST" action="/add_employee">
             <div class="form-group">
                 <label>👤 Employee Name:</label>
@@ -527,9 +526,6 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
             </div>
             <button type="submit" class="btn">Add Employee</button>
         </form>
-        {% else %}
-        <p style="color:#4a5568;">Only an admin can add employees. <a href="/login">Admin Login</a></p>
-        {% endif %}
     </div>
     
     <div class="card">
@@ -745,8 +741,6 @@ def employees():
 
 @app.route('/add_employee', methods=['POST'])
 def add_employee():
-    if not session.get('is_admin', False):
-        return redirect(url_for('employees', message='Admin login required to add employees'))
     data = load_data()
     name = request.form.get('name', '').strip()
     department = request.form.get('department', '').strip()
@@ -873,6 +867,17 @@ def export_csv():
 
     filename = f"attendance_export_{filter_date or 'all'}.csv"
     return send_file(output, mimetype='text/csv', as_attachment=True, download_name=filename)
+
+
+@app.route('/health')
+def health():
+    info = {'redis_configured': bool(REDIS_URL and REDIS_TOKEN)}
+    if REDIS_URL and REDIS_TOKEN:
+        try:
+            info['redis_ping'] = _redis('ping').get('result')
+        except Exception as e:
+            info['redis_error'] = str(e)
+    return jsonify(info)
 
 
 if __name__ == '__main__':
