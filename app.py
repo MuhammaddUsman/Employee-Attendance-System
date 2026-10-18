@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import json
 import os
 import csv
+import re
 import io
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -69,342 +70,72 @@ BASE_TEMPLATE = r'''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Employee Attendance System</title>
+    <title>{{ company_name }} - Attendance</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 50%, #7e22ce 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            box-shadow: 0 25px 80px rgba(0,0,0,0.4);
-            overflow: hidden;
-            backdrop-filter: blur(10px);
-        }
-        .header {
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 50%, #7e22ce 100%);
-            color: white;
-            padding: 40px;
-            text-align: center;
-            position: relative;
-            overflow: hidden;
-        }
-        .header::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
-            animation: pulse 4s ease-in-out infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.1); }
-        }
-        .header h1 { 
-            font-size: 2.8em; 
-            margin-bottom: 10px; 
-            position: relative;
-            z-index: 1;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        }
-        .header p {
-            position: relative;
-            z-index: 1;
-            font-size: 1.1em;
-            opacity: 0.9;
-        }
-        .nav {
-            display: flex;
-            justify-content: center;
-            gap: 10px;
-            padding: 25px;
-            background: linear-gradient(to right, #f8f9fa, #e9ecef);
-            border-bottom: 3px solid #dee2e6;
-            flex-wrap: wrap;
-        }
-        .nav a {
-            padding: 14px 28px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-decoration: none;
-            border-radius: 50px;
-            transition: all 0.3s ease;
-            font-weight: 600;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-            position: relative;
-            overflow: hidden;
-        }
-        .nav a::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
-            border-radius: 50%;
-            background: rgba(255,255,255,0.2);
-            transform: translate(-50%, -50%);
-            transition: width 0.6s, height 0.6s;
-        }
-        .nav a:hover::before {
-            width: 300px;
-            height: 300px;
-        }
-        .nav a:hover { 
-            transform: translateY(-3px) scale(1.05); 
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
-        }
-        .content { padding: 40px; background: #fafbfc; }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 25px;
-            border-radius: 15px;
-            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);
-            transition: transform 0.3s;
-        }
-        .stat-card:hover {
-            transform: translateY(-5px);
-        }
-        .stat-card h3 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }
-        .stat-card p {
-            opacity: 0.9;
-            font-size: 1.1em;
-        }
-        .form-group {
-            margin-bottom: 25px;
-        }
-        .form-group label {
-            display: block;
-            margin-bottom: 10px;
-            font-weight: 700;
-            color: #2d3748;
-            font-size: 1em;
-        }
-        .form-group input, .form-group select {
-            width: 100%;
-            padding: 15px 18px;
-            border: 2px solid #e2e8f0;
-            border-radius: 12px;
-            font-size: 1em;
-            transition: all 0.3s;
-            background: white;
-        }
-        .form-group input:focus, .form-group select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            transform: translateY(-2px);
-        }
-        .btn {
-            padding: 15px 35px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            font-size: 1.1em;
-            font-weight: 700;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-            position: relative;
-            overflow: hidden;
-        }
-        .btn::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
-            border-radius: 50%;
-            background: rgba(255,255,255,0.3);
-            transform: translate(-50%, -50%);
-            transition: width 0.6s, height 0.6s;
-        }
-        .btn:hover::after {
-            width: 400px;
-            height: 400px;
-        }
-        .btn:hover { 
-            transform: translateY(-3px); 
-            box-shadow: 0 6px 25px rgba(102, 126, 234, 0.6);
-        }
-        .btn-success { 
-            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
-            box-shadow: 0 4px 15px rgba(40, 167, 69, 0.4);
-        }
-        .btn-success:hover { 
-            box-shadow: 0 6px 25px rgba(40, 167, 69, 0.6);
-        }
-        .btn-danger { 
-            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
-            box-shadow: 0 4px 15px rgba(220, 53, 69, 0.4);
-        }
-        .btn-danger:hover { 
-            box-shadow: 0 6px 25px rgba(220, 53, 69, 0.6);
-        }
-        table {
-            width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            margin-top: 20px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-            border-radius: 12px;
-            overflow: hidden;
-            background: white;
-        }
-        table th {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 18px 15px;
-            text-align: left;
-            font-weight: 700;
-            text-transform: uppercase;
-            font-size: 0.9em;
-            letter-spacing: 0.5px;
-        }
-        table td {
-            padding: 18px 15px;
-            border-bottom: 1px solid #e2e8f0;
-            color: #2d3748;
-        }
-        table tbody tr {
-            transition: all 0.3s;
-        }
-        table tbody tr:hover { 
-            background: #f7fafc; 
-            transform: scale(1.01);
-            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-        }
-        .status-in { 
-            color: #28a745; 
-            font-weight: 700;
-            background: #d4edda;
-            padding: 6px 12px;
-            border-radius: 20px;
-            display: inline-block;
-        }
-        .status-out { 
-            color: #dc3545; 
-            font-weight: 700;
-            background: #f8d7da;
-            padding: 6px 12px;
-            border-radius: 20px;
-            display: inline-block;
-        }
-        .card {
-            background: white;
-            padding: 35px;
-            border-radius: 15px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-            margin-bottom: 25px;
-            border: 1px solid #e2e8f0;
-            transition: all 0.3s;
-        }
-        .card:hover {
-            box-shadow: 0 8px 30px rgba(0,0,0,0.12);
-            transform: translateY(-2px);
-        }
-        .clock-display {
-            text-align: center;
-            font-size: 3.5em;
-            font-weight: 900;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin: 25px 0;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        }
-        .date-display {
-            text-align: center;
-            font-size: 1.3em;
-            color: #4a5568;
-            margin-bottom: 20px;
-            font-weight: 600;
-        }
-        .success-msg {
-            background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-            color: #155724;
-            padding: 18px 20px;
-            border-radius: 12px;
-            margin-bottom: 25px;
-            border-left: 5px solid #28a745;
-            box-shadow: 0 4px 10px rgba(40, 167, 69, 0.2);
-            font-weight: 600;
-        }
-        .error-msg {
-            background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
-            color: #721c24;
-            padding: 18px 20px;
-            border-radius: 12px;
-            margin-bottom: 25px;
-            border-left: 5px solid #dc3545;
-            box-shadow: 0 4px 10px rgba(220, 53, 69, 0.2);
-            font-weight: 600;
-        }
-        .button-group {
-            display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
-        }
-        .button-group .btn {
-            flex: 1;
-            min-width: 180px;
-        }
-        .login-inline {
-            display:inline-flex;
-            gap:8px;
-            align-items:center;
-        }
-        .login-inline input {
-            padding:8px;
-            border-radius:6px;
-            border:1px solid #e2e8f0;
-        }
+        :root{--navy:#0f2547;--blue:#2563eb;--bg:#f1f5f9;--text:#0f172a;--muted:#64748b;--line:#e2e8f0;--green:#15803d;--red:#b91c1c}
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Inter','Segoe UI',system-ui,-apple-system,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:15px;line-height:1.5}
+        .topbar{background:var(--navy);position:sticky;top:0;z-index:10;box-shadow:0 1px 4px rgba(0,0,0,.25)}
+        .topbar-inner{max-width:1200px;margin:0 auto;padding:0 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;min-height:60px}
+        .brand{color:#fff;font-weight:700;font-size:1.1rem;display:flex;align-items:center;gap:10px}
+        .brand-mark{width:32px;height:32px;border-radius:8px;background:var(--blue);display:inline-flex;align-items:center;justify-content:center;font-size:1rem}
+        .nav{display:flex;gap:4px;flex-wrap:wrap;padding:8px 0}
+        .nav a{color:#cbd5e1;text-decoration:none;padding:8px 14px;border-radius:8px;font-weight:500;font-size:.92rem;transition:background .15s,color .15s}
+        .nav a:hover{background:rgba(255,255,255,.1);color:#fff}
+        .nav a.active{background:rgba(255,255,255,.18);color:#fff}
+        .container{max-width:1200px;margin:0 auto;padding:28px 24px 40px}
+        .footer{text-align:center;color:var(--muted);font-size:.82rem;padding:0 24px 28px}
+        .page-title{font-size:1.25rem;font-weight:700;color:var(--text);margin-bottom:16px}
+        .card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 2px rgba(15,23,42,.05);overflow-x:auto}
+        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}
+        .stat-card{background:#fff;border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:12px;padding:16px 20px}
+        .stat-card .num{font-size:1.9rem;font-weight:700;line-height:1.1}
+        .stat-card .lbl{color:var(--muted);font-size:.78rem;margin-top:4px;text-transform:uppercase;letter-spacing:.06em}
+        .form-group{margin-bottom:18px}
+        .form-group label,.card label{display:block;margin-bottom:6px;font-weight:600;color:#334155;font-size:.9rem}
+        .form-group input,.form-group select,.card input[type=date],.card input[type=month]{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;font-size:.95rem;background:#fff;font-family:inherit}
+        .card input[type=date],.card input[type=month]{width:auto;display:inline-block}
+        .card form label{display:inline-block;margin-bottom:0}
+        input:focus,select:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+        .btn{display:inline-block;padding:10px 20px;background:var(--blue);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:.92rem;font-weight:600;text-decoration:none;font-family:inherit;transition:background .15s}
+        .btn:hover{background:#1d4ed8}
+        .btn-success{background:var(--green)}.btn-success:hover{background:#166534}
+        .btn-danger{background:var(--red)}.btn-danger:hover{background:#991b1b}
+        table{width:100%;border-collapse:collapse;margin-top:8px;min-width:560px}
+        table th{background:#f8fafc;color:var(--muted);padding:12px 14px;text-align:left;font-weight:600;text-transform:uppercase;font-size:.74rem;letter-spacing:.05em;border-bottom:2px solid var(--line)}
+        table td{padding:12px 14px;border-bottom:1px solid var(--line);color:#1e293b}
+        table tbody tr:nth-child(even){background:#fafbfd}
+        table tbody tr:hover{background:#f1f5f9}
+        .status-in,.status-out{font-weight:600;font-size:.8rem;padding:4px 12px;border-radius:999px;display:inline-block}
+        .status-in{color:#166534;background:#dcfce7}
+        .status-out{color:#475569;background:#e2e8f0}
+        .clock-display{text-align:center;font-size:3rem;font-weight:700;color:var(--navy);margin:6px 0 20px;font-variant-numeric:tabular-nums}
+        .date-display{text-align:center;color:var(--muted);font-weight:500;margin-bottom:4px}
+        .success-msg,.error-msg{padding:12px 16px;border-radius:8px;margin-bottom:18px;font-weight:500;font-size:.92rem}
+        .success-msg{background:#f0fdf4;color:#166534;border:1px solid #bbf7d0}
+        .error-msg{background:#fef2f2;color:#991b1b;border:1px solid #fecaca}
+        .button-group{display:flex;gap:12px;flex-wrap:wrap}
+        .button-group .btn{flex:1;min-width:150px;padding:12px 20px}
+        @media(max-width:640px){.container{padding:18px 14px 30px}.card{padding:16px}.clock-display{font-size:2.3rem}.topbar-inner{padding:0 14px}}
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🕐 Employee Attendance System</h1>
-            <p>Track and manage employee attendance efficiently</p>
-        </div>
+    {% set p = request.path %}
+    <div class="topbar"><div class="topbar-inner">
+        <div class="brand"><span class="brand-mark">{{ company_name[:1] }}</span>{{ company_name }}</div>
         <div class="nav">
-            <a href="/">Clock In/Out</a>
-            <a href="/employees">Employees</a>
-            <a href="/records">Attendance Records</a>
-            <a href="/reports">Reports</a>
+            <a href="/" class="{{ 'active' if p == '/' }}">Clock In/Out</a>
+            <a href="/employees" class="{{ 'active' if p == '/employees' }}">Employees</a>
+            <a href="/records" class="{{ 'active' if p == '/records' }}">Attendance Records</a>
+            <a href="/reports" class="{{ 'active' if p == '/reports' }}">Reports</a>
             <a href="/export">Export Excel</a>
-            {% if is_admin %}
-                <a href="/logout">Logout</a>
-            {% else %}
-                <a href="/login">Admin Login</a>
-            {% endif %}
+            {% if is_admin %}<a href="/logout">Logout</a>{% else %}<a href="/login" class="{{ 'active' if p == '/login' }}">Admin Login</a>{% endif %}
         </div>
-        <div class="content">
-            {% block content %}{% endblock %}
-        </div>
+    </div></div>
+    <div class="container">
+        {% block content %}{% endblock %}
     </div>
+    <div class="footer">&copy; {{ company_name }} &middot; Attendance Management System</div>
     <script>
         function updateClock() {
             const now = new Date();
@@ -428,7 +159,7 @@ BASE_TEMPLATE = r'''
 
 LOGIN_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
     <div class="card" style="max-width:480px;margin:0 auto;">
-        <h2 style="margin-bottom: 20px; color: #2d3748; font-size: 1.8em;">🔒 Admin Login</h2>
+        <h2 class="page-title">Admin Login</h2>
         {% if message %}
             <div class="error-msg">{{ message }}</div>
         {% endif %}
@@ -447,8 +178,13 @@ LOGIN_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
 
 
 HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
+    <div class="stats-grid">
+        <div class="stat-card"><div class="num">{{ total_employees }}</div><div class="lbl">Total Employees</div></div>
+        <div class="stat-card"><div class="num">{{ working_now }}</div><div class="lbl">Working Now</div></div>
+        <div class="stat-card"><div class="num">{{ completed_today }}</div><div class="lbl">Completed Today</div></div>
+    </div>
     <div class="card">
-        <h2 style="margin-bottom: 20px; color: #2d3748; font-size: 1.8em;">⏰ Clock In/Out</h2>
+        <h2 class="page-title">Clock In/Out</h2>
         <div class="date-display" id="live-date"></div>
         <div class="clock-display" id="live-clock"></div>
         {% if message %}
@@ -458,7 +194,7 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
         {% endif %}
         <form method="POST" action="/clock">
             <div class="form-group">
-                <label>👤 Select Employee:</label>
+                <label>Select Employee:</label>
                 <select name="employee_id" required>
                     <option value="">-- Choose Employee --</option>
                     {% for emp_id, emp in employees.items() %}
@@ -467,14 +203,14 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
                 </select>
             </div>
             <div class="button-group">
-                <button type="submit" name="action" value="in" class="btn btn-success">✓ Clock In</button>
-                <button type="submit" name="action" value="out" class="btn btn-danger">✗ Clock Out</button>
+                <button type="submit" name="action" value="in" class="btn btn-success">Clock In</button>
+                <button type="submit" name="action" value="out" class="btn btn-danger">Clock Out</button>
             </div>
         </form>
     </div>
     
     <div class="card">
-        <h3 style="color: #2d3748; margin-bottom: 20px; font-size: 1.6em;">📊 Today's Activity</h3>
+        <h3 class="page-title">Today's Activity</h3>
         <table>
             <thead>
                 <tr>
@@ -494,7 +230,7 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
                     <td>{{ record.clock_out or '-' }}</td>
                     <td>
                         <span class="{% if record.clock_out %}status-out{% else %}status-in{% endif %}">
-                            {% if record.clock_out %}Clocked Out{% else %}● Working{% endif %}
+                            {% if record.clock_out %}Clocked Out{% else %}Working{% endif %}
                         </span>
                     </td>
                 </tr>
@@ -507,21 +243,21 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
 
 EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
     <div class="card">
-        <h2 style="margin-bottom: 20px; color: #2d3748; font-size: 1.8em;">➕ Add New Employee</h2>
+        <h2 class="page-title">Add New Employee</h2>
         {% if message %}
-        <div class="success-msg">✓ {{ message }}</div>
+        <div class="success-msg">{{ message }}</div>
         {% endif %}
         <form method="POST" action="/add_employee">
             <div class="form-group">
-                <label>👤 Employee Name:</label>
+                <label>Employee Name:</label>
                 <input type="text" name="name" required placeholder="Enter full name">
             </div>
             <div class="form-group">
-                <label>🏢 Department:</label>
+                <label>Department:</label>
                 <input type="text" name="department" required placeholder="e.g., IT, HR, Sales">
             </div>
             <div class="form-group">
-                <label>💼 Position:</label>
+                <label>Position:</label>
                 <input type="text" name="position" required placeholder="e.g., Manager, Developer">
             </div>
             <button type="submit" class="btn">Add Employee</button>
@@ -529,7 +265,7 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
     </div>
     
     <div class="card">
-        <h3 style="color: #2d3748; margin-bottom: 20px; font-size: 1.6em;">👥 Employee List</h3>
+        <h3 class="page-title">Employee List</h3>
         <table>
             <thead>
                 <tr>
@@ -571,12 +307,17 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
 
 RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
     <div class="card">
-        <h2 style="color: #333;">Attendance Records</h2>
+        <h2 class="page-title">Attendance Records</h2>
         <form method="GET" action="/records" style="margin-bottom:16px;">
             <label>Filter by date:</label>
             <input type="date" name="date" value="{{ filter_date or '' }}" style="padding:8px;border-radius:8px;border:1px solid #e2e8f0;margin-left:8px;">
             <button class="btn" style="margin-left:8px;">Apply</button>
             <a href="/records" class="btn" style="margin-left:8px;">Clear</a>
+        </form>
+        <form method="GET" action="/export" style="margin-bottom:16px;">
+            <label>Download monthly Excel sheet:</label>
+            <input type="month" name="month" value="{{ current_month }}" style="padding:8px;border-radius:8px;border:1px solid #e2e8f0;margin-left:8px;">
+            <button class="btn" style="margin-left:8px;">Download</button>
         </form>
         <table>
             <thead>
@@ -608,7 +349,7 @@ RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
 
 REPORTS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
     <div class="card">
-        <h2 style="color: #333;">Weekly Attendance Report</h2>
+        <h2 class="page-title">Weekly Attendance Report</h2>
         <table>
             <thead>
                 <tr>
@@ -681,6 +422,11 @@ def parse_bool_param(val):
     return str(val) in ('1', 'true', 'True', 'yes', 'Yes')
 
 
+@app.context_processor
+def inject_company():
+    return {'company_name': COMPANY_NAME}
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -711,6 +457,9 @@ def index():
                                  today_records=today_records,
                                  message=message,
                                  success=success,
+                                 total_employees=len(data['employees']),
+                                 working_now=sum(1 for r in today_records if not r.get('clock_out')),
+                                 completed_today=sum(1 for r in today_records if r.get('clock_out')),
                                  is_admin=session.get('is_admin', False))
 
 @app.route('/clock', methods=['POST'])
@@ -821,7 +570,7 @@ def records():
             record['hours_worked'] = 'In Progress'
 
     records = list(reversed(records))
-    return render_template_string(RECORDS_TEMPLATE, records=records, filter_date=filter_date, is_admin=session.get('is_admin', False))
+    return render_template_string(RECORDS_TEMPLATE, records=records, filter_date=filter_date, current_month=now_local().strftime('%Y-%m'), is_admin=session.get('is_admin', False))
 
 @app.route('/reports')
 def reports():
@@ -859,10 +608,12 @@ DURATION_FMT = '[h]"h "mm"m"'
 WORK_HOURS_PER_DAY = float(os.environ.get('WORK_HOURS_PER_DAY', '8'))
 
 
-def build_export_rows(data, filter_date=None):
+def build_export_rows(data, filter_date=None, month=None):
     rows = []
     for r in sorted(data['attendance'], key=lambda x: (x['date'], x.get('clock_in') or '')):
         if filter_date and r['date'] != filter_date:
+            continue
+        if month and not r['date'].startswith(month):
             continue
         if r.get('clock_out'):
             h = hours_between(r['date'], r.get('clock_in'), r['clock_out'])
@@ -882,7 +633,7 @@ def build_export_rows(data, filter_date=None):
     return rows
 
 
-def build_excel(rows, filter_date):
+def build_excel(rows, filter_date, month=None, report_title='Attendance Sheet'):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -893,9 +644,11 @@ def build_excel(rows, filter_date):
     head_font = Font(name='Calibri', bold=True, color=WHITE, size=11)
     head_fill = PatternFill('solid', fgColor=NAVY)
     center = Alignment(horizontal='center', vertical='center')
-    left = Alignment(horizontal='left', vertical='center')
+    left = Alignment(horizontal='left', vertical='center', indent=1)
 
-    if filter_date:
+    if month:
+        period = datetime.strptime(month, '%Y-%m').strftime('%B %Y')
+    elif filter_date:
         period = datetime.strptime(filter_date, '%Y-%m-%d').strftime('%d %B %Y')
     elif rows:
         d1 = datetime.strptime(rows[0]['date'], '%Y-%m-%d').strftime('%d %b %Y')
@@ -910,12 +663,15 @@ def build_excel(rows, filter_date):
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
         ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=last_col)
         ws['A1'] = COMPANY_NAME
-        ws['A1'].font = Font(name='Calibri', bold=True, size=18, color=NAVY)
+        ws['A1'].font = Font(name='Calibri', bold=True, size=18, color=WHITE)
+        for c in range(1, last_col + 1):
+            ws.cell(row=1, column=c).fill = PatternFill('solid', fgColor=NAVY)
+        ws['A2'].font = Font(name='Calibri', bold=True, size=14, color=NAVY)
         ws['A2'] = title
         ws['A2'].font = Font(name='Calibri', bold=True, size=13, color='444444')
         ws['A3'] = f'Period: {period}     |     Generated: {generated}'
         ws['A3'].font = Font(name='Calibri', italic=True, size=10, color='666666')
-        ws.row_dimensions[1].height = 28
+        ws.row_dimensions[1].height = 34
         for r in (1, 2, 3):
             ws.cell(row=r, column=1).alignment = left
 
@@ -936,13 +692,16 @@ def build_excel(rows, filter_date):
         ws.sheet_view.showGridLines = False
 
     wb = Workbook()
+    wb.properties.title = report_title
+    wb.properties.creator = COMPANY_NAME
 
     # ---------------- Sheet 1: Daily attendance ----------------
     ws = wb.active
     ws.title = 'Attendance'
+    ws.sheet_properties.tabColor = NAVY
     headers = ['Date', 'Day', 'Employee ID', 'Employee Name', 'Department',
                'Clock In', 'Clock Out', 'Time Worked', 'Status']
-    title_block(ws, 'Daily Attendance Report', len(headers))
+    title_block(ws, report_title, len(headers))
     HR = 5
     header_row(ws, HR, headers)
 
@@ -998,6 +757,7 @@ def build_excel(rows, filter_date):
 
     # ---------------- Sheet 2: Summary per employee ----------------
     ws2 = wb.create_sheet('Summary')
+    ws2.sheet_properties.tabColor = '2563EB'
     summary = {}
     for row in rows:
         e = summary.setdefault(row['emp_id'], {'name': row['name'], 'dept': row['dept'],
@@ -1007,7 +767,7 @@ def build_excel(rows, filter_date):
             e['hours'] += row['hours']
     sh = ['Employee ID', 'Employee Name', 'Department', 'Days Present', 'Total Time',
           'Average / Day', f'Expected ({WORK_HOURS_PER_DAY:g}h/day)', 'Difference']
-    title_block(ws2, 'Employee Summary', len(sh))
+    title_block(ws2, report_title.replace('Attendance Sheet', 'Employee Summary'), len(sh))
     header_row(ws2, HR, sh)
 
     def summary_row(r, vals, diff_hours, fill=None, bold=False, color=None):
@@ -1061,12 +821,31 @@ def export_file():
     data = load_data()
     filter_date = request.args.get('date')
     fmt = request.args.get('format', 'xlsx')
-    rows = build_export_rows(data, filter_date)
-    base_name = f"attendance_report_{filter_date or 'all'}"
+    month = request.args.get('month')
+
+    # Default: the current month. Use ?month=all for every record.
+    if filter_date:
+        month = None
+    elif month == 'all':
+        month = None
+    elif not month or not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
+        month = now_local().strftime('%Y-%m')
+
+    rows = build_export_rows(data, filter_date, month)
+
+    if month:
+        month_label = datetime.strptime(month, '%Y-%m').strftime('%B %Y')
+        report_title = f'{month_label} Attendance Sheet'
+    elif filter_date:
+        day_label = datetime.strptime(filter_date, '%Y-%m-%d').strftime('%d %B %Y')
+        report_title = f'Attendance Sheet - {day_label}'
+    else:
+        report_title = 'Attendance Sheet - All Records'
+    base_name = report_title
 
     if fmt != 'csv':
         try:
-            output = build_excel(rows, filter_date)
+            output = build_excel(rows, filter_date, month, report_title)
             return send_file(
                 output,
                 mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
