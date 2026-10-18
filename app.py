@@ -586,7 +586,7 @@ RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
                     <th>Department</th>
                     <th>Clock In</th>
                     <th>Clock Out</th>
-                    <th>Hours Worked</th>
+                    <th>Time Worked</th>
                 </tr>
             </thead>
             <tbody>
@@ -615,8 +615,8 @@ REPORTS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
                     <th>Employee</th>
                     <th>Department</th>
                     <th>Days Present</th>
-                    <th>Total Hours</th>
-                    <th>Average Hours/Day</th>
+                    <th>Total Time</th>
+                    <th>Average Time/Day</th>
                 </tr>
             </thead>
             <tbody>
@@ -625,8 +625,8 @@ REPORTS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
                     <td>{{ report.name }}</td>
                     <td>{{ report.department }}</td>
                     <td>{{ report.days_present }}</td>
-                    <td>{{ "%.2f"|format(report.total_hours) }}</td>
-                    <td>{{ "%.2f"|format(report.avg_hours) }}</td>
+                    <td>{{ report.total_text }}</td>
+                    <td>{{ report.avg_text }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -647,6 +647,20 @@ def hours_between(date_str, clock_in, clock_out):
     if hours < 0:
         return None
     return hours
+
+
+def format_duration(hours, signed=False):
+    """7.5 -> '7h 30m'. Under one minute -> '36s'. signed=True adds +/-."""
+    if hours is None:
+        return ''
+    secs = round(abs(hours) * 3600)
+    if 0 < secs < 60 and not signed:
+        return f'{secs}s'
+    h, m = divmod(round(secs / 60), 60)
+    text = f'{h}h {m:02d}m'
+    if signed:
+        text = ('-' if hours < 0 else '+') + text if (h or m) else text
+    return text
 
 
 def next_employee_id(employees):
@@ -802,7 +816,7 @@ def records():
     for record in records:
         if record.get('clock_out'):
             h = hours_between(record['date'], record.get('clock_in'), record['clock_out'])
-            record['hours_worked'] = f"{h:.2f} hrs" if h is not None else 'Check times'
+            record['hours_worked'] = format_duration(h) if h is not None else 'Check times'
         else:
             record['hours_worked'] = 'In Progress'
 
@@ -835,10 +849,13 @@ def reports():
     for emp_id in weekly_report:
         days = weekly_report[emp_id]['days_present']
         weekly_report[emp_id]['avg_hours'] = weekly_report[emp_id]['total_hours'] / days if days > 0 else 0.0
+        weekly_report[emp_id]['total_text'] = format_duration(weekly_report[emp_id]['total_hours'])
+        weekly_report[emp_id]['avg_text'] = format_duration(weekly_report[emp_id]['avg_hours'])
 
     return render_template_string(REPORTS_TEMPLATE, weekly_report=weekly_report, is_admin=session.get('is_admin', False))
 
 COMPANY_NAME = os.environ.get('COMPANY_NAME', 'Employee Attendance System')
+DURATION_FMT = '[h]"h "mm"m"'
 WORK_HOURS_PER_DAY = float(os.environ.get('WORK_HOURS_PER_DAY', '8'))
 
 
@@ -849,7 +866,7 @@ def build_export_rows(data, filter_date=None):
             continue
         if r.get('clock_out'):
             h = hours_between(r['date'], r.get('clock_in'), r['clock_out'])
-            hours, status = (round(h, 2), 'Completed') if h is not None else (None, 'Check times')
+            hours, status = (h, 'Completed') if h is not None else (None, 'Check times')
         else:
             hours, status = None, 'In Progress'
         try:
@@ -924,7 +941,7 @@ def build_excel(rows, filter_date):
     ws = wb.active
     ws.title = 'Attendance'
     headers = ['Date', 'Day', 'Employee ID', 'Employee Name', 'Department',
-               'Clock In', 'Clock Out', 'Hours Worked', 'Status']
+               'Clock In', 'Clock Out', 'Time Worked', 'Status']
     title_block(ws, 'Daily Attendance Report', len(headers))
     HR = 5
     header_row(ws, HR, headers)
@@ -942,7 +959,7 @@ def build_excel(rows, filter_date):
             row['name'], row['dept'],
             datetime.strptime(row['clock_in'], '%H:%M:%S').time() if row['clock_in'] else None,
             datetime.strptime(row['clock_out'], '%H:%M:%S').time() if row['clock_out'] else None,
-            row['hours'], row['status'],
+            round(row['hours'] * 60) / 1440 if row['hours'] is not None else None, row['status'],
         ]
         for col, v in enumerate(vals, 1):
             c = ws.cell(row=r, column=col, value=v)
@@ -954,7 +971,7 @@ def build_excel(rows, filter_date):
         ws.cell(row=r, column=1).number_format = 'dd-mmm-yyyy'
         ws.cell(row=r, column=6).number_format = 'hh:mm AM/PM'
         ws.cell(row=r, column=7).number_format = 'hh:mm AM/PM'
-        ws.cell(row=r, column=8).number_format = '0.00'
+        ws.cell(row=r, column=8).number_format = DURATION_FMT
         fg, bg = status_style[row['status']]
         sc = ws.cell(row=r, column=9)
         sc.font = Font(name='Calibri', bold=True, size=11, color=fg)
@@ -972,7 +989,7 @@ def build_excel(rows, filter_date):
             c.fill = PatternFill('solid', fgColor='DCE3F0')
             c.border = Border(top=Side(style='medium', color=NAVY), bottom=thin, left=thin, right=thin)
             c.alignment = center
-        ws.cell(row=r, column=8).number_format = '0.00'
+        ws.cell(row=r, column=8).number_format = DURATION_FMT
         ws.auto_filter.ref = f'A{HR}:{get_column_letter(len(headers))}{last}'
     ws.freeze_panes = ws.cell(row=HR + 1, column=1)
     for i, w in enumerate([14, 13, 14, 24, 18, 12, 12, 14, 14], 1):
@@ -988,45 +1005,46 @@ def build_excel(rows, filter_date):
         if row['status'] == 'Completed':
             e['days'] += 1
             e['hours'] += row['hours']
-    sh = ['Employee ID', 'Employee Name', 'Department', 'Days Present', 'Total Hours',
-          'Avg Hours / Day', f'Expected Hours ({WORK_HOURS_PER_DAY:g}h/day)', 'Difference']
+    sh = ['Employee ID', 'Employee Name', 'Department', 'Days Present', 'Total Time',
+          'Average / Day', f'Expected ({WORK_HOURS_PER_DAY:g}h/day)', 'Difference']
     title_block(ws2, 'Employee Summary', len(sh))
     header_row(ws2, HR, sh)
+
+    def summary_row(r, vals, diff_hours, fill=None, bold=False, color=None):
+        for col, v in enumerate(vals, 1):
+            c = ws2.cell(row=r, column=col, value=v)
+            c.border = border
+            c.font = Font(name='Calibri', size=11, bold=bold, color=color)
+            c.alignment = left if col in (2, 3) else center
+            if fill:
+                c.fill = PatternFill('solid', fgColor=fill)
+        d = ws2.cell(row=r, column=8)
+        d.font = Font(name='Calibri', bold=True, size=11,
+                      color='1E7B34' if diff_hours >= 0 else 'B42318')
+
     r = HR
+    tot_days = tot_hours = 0
     for i, (eid, e) in enumerate(sorted(summary.items())):
         r += 1
         expected = e['days'] * WORK_HOURS_PER_DAY
         avg = e['hours'] / e['days'] if e['days'] else 0
-        vals = [eid, e['name'], e['dept'], e['days'], round(e['hours'], 2),
-                round(avg, 2), round(expected, 2), round(e['hours'] - expected, 2)]
-        for col, v in enumerate(vals, 1):
-            c = ws2.cell(row=r, column=col, value=v)
-            c.border = border
-            c.font = Font(name='Calibri', size=11)
-            c.alignment = left if col in (2, 3) else center
-            if i % 2 == 1:
-                c.fill = PatternFill('solid', fgColor=BAND)
-            if col >= 5:
-                c.number_format = '0.00'
-        diff = ws2.cell(row=r, column=8)
-        diff.number_format = '+0.00;-0.00;0.00'
-        diff.font = Font(name='Calibri', bold=True, size=11,
-                         color='1E7B34' if vals[7] >= 0 else 'B42318')
+        tot_days += e['days']
+        tot_hours += e['hours']
+        summary_row(r, [eid, e['name'], e['dept'], e['days'], format_duration(e['hours']),
+                        format_duration(avg), format_duration(expected),
+                        format_duration(e['hours'] - expected, signed=True)],
+                    e['hours'] - expected, fill=BAND if i % 2 else None)
     if summary:
-        first2, last2 = HR + 1, r
         r += 1
-        ws2.cell(row=r, column=1, value='TOTAL')
-        for col in (4, 5, 7, 8):
-            L = get_column_letter(col)
-            ws2.cell(row=r, column=col, value=f'=SUM({L}{first2}:{L}{last2})')
-        for col in range(1, len(sh) + 1):
-            c = ws2.cell(row=r, column=col)
-            c.font = Font(name='Calibri', bold=True, size=11, color=NAVY)
-            c.fill = PatternFill('solid', fgColor='DCE3F0')
-            c.border = Border(top=Side(style='medium', color=NAVY), bottom=thin, left=thin, right=thin)
-            c.alignment = center
-            if col >= 5:
-                c.number_format = '0.00'
+        tot_expected = tot_days * WORK_HOURS_PER_DAY
+        summary_row(r, ['TOTAL', '', '', tot_days, format_duration(tot_hours),
+                        format_duration(tot_hours / tot_days if tot_days else 0),
+                        format_duration(tot_expected),
+                        format_duration(tot_hours - tot_expected, signed=True)],
+                    tot_hours - tot_expected, fill='DCE3F0', bold=True, color=NAVY)
+        ws2.cell(row=r, column=8).font = Font(
+            name='Calibri', bold=True, size=11,
+            color='1E7B34' if tot_hours - tot_expected >= 0 else 'B42318')
     ws2.freeze_panes = ws2.cell(row=HR + 1, column=1)
     for i, w in enumerate([14, 24, 18, 14, 14, 16, 26, 14], 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
@@ -1059,11 +1077,11 @@ def export_file():
     si = io.StringIO()
     writer = csv.writer(si)
     writer.writerow(['Date', 'Day', 'Employee ID', 'Employee Name', 'Department',
-                     'Clock In', 'Clock Out', 'Hours Worked', 'Status'])
+                     'Clock In', 'Clock Out', 'Time Worked', 'Status'])
     for x in rows:
         writer.writerow([x['date'], x['day'], x['emp_id'], x['name'], x['dept'],
                          x['clock_in'], x['clock_out'],
-                         '' if x['hours'] is None else x['hours'], x['status']])
+                         format_duration(x['hours']), x['status']])
     output = io.BytesIO()
     output.write(b'\xef\xbb\xbf')  # BOM so Excel reads the file correctly
     output.write(si.getvalue().encode('utf-8'))
