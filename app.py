@@ -394,7 +394,7 @@ BASE_TEMPLATE = r'''
             <a href="/employees">Employees</a>
             <a href="/records">Attendance Records</a>
             <a href="/reports">Reports</a>
-            <a href="/export">Export CSV</a>
+            <a href="/export">Export Excel</a>
             {% if is_admin %}
                 <a href="/logout">Logout</a>
             {% else %}
@@ -635,6 +635,20 @@ REPORTS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
 ''')
 
 
+def hours_between(date_str, clock_in, clock_out):
+    """Hours worked on a record. Returns None if the times are invalid
+    (for example clock-out earlier than clock-in)."""
+    try:
+        a = datetime.strptime(f"{date_str} {clock_in}", '%Y-%m-%d %H:%M:%S')
+        b = datetime.strptime(f"{date_str} {clock_out}", '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+    hours = (b - a).total_seconds() / 3600
+    if hours < 0:
+        return None
+    return hours
+
+
 def next_employee_id(employees):
     max_n = 0
     for eid in employees.keys():
@@ -786,18 +800,11 @@ def records():
         records = [r for r in records if r['date'] == filter_date]
 
     for record in records:
-        try:
-            if record.get('clock_out'):
-                clock_in = datetime.strptime(f"{record['date']} {record['clock_in']}", '%Y-%m-%d %H:%M:%S')
-                clock_out = datetime.strptime(f"{record['date']} {record['clock_out']}", '%Y-%m-%d %H:%M:%S')
-                hours = (clock_out - clock_in).total_seconds() / 3600
-                if hours < 0:
-                    hours += 24
-                record['hours_worked'] = f"{hours:.2f} hrs"
-            else:
-                record['hours_worked'] = 'In Progress'
-        except Exception:
-            record['hours_worked'] = 'N/A'
+        if record.get('clock_out'):
+            h = hours_between(record['date'], record.get('clock_in'), record['clock_out'])
+            record['hours_worked'] = f"{h:.2f} hrs" if h is not None else 'Check times'
+        else:
+            record['hours_worked'] = 'In Progress'
 
     records = list(reversed(records))
     return render_template_string(RECORDS_TEMPLATE, records=records, filter_date=filter_date, is_admin=session.get('is_admin', False))
@@ -820,14 +827,7 @@ def reports():
                     'days_present': 0,
                     'total_hours': 0.0
                 }
-            try:
-                clock_in = datetime.strptime(f"{record['date']} {record['clock_in']}", '%Y-%m-%d %H:%M:%S')
-                clock_out = datetime.strptime(f"{record['date']} {record['clock_out']}", '%Y-%m-%d %H:%M:%S')
-                hours = (clock_out - clock_in).total_seconds() / 3600
-                if hours < 0:
-                    hours += 24
-            except Exception:
-                hours = 0.0
+            hours = hours_between(record['date'], record.get('clock_in'), record['clock_out']) or 0.0
 
             weekly_report[emp_id]['days_present'] += 1
             weekly_report[emp_id]['total_hours'] += hours
@@ -838,35 +838,238 @@ def reports():
 
     return render_template_string(REPORTS_TEMPLATE, weekly_report=weekly_report, is_admin=session.get('is_admin', False))
 
-@app.route('/export')
-def export_csv():
-    data = load_data()
-    filter_date = request.args.get('date')
+COMPANY_NAME = os.environ.get('COMPANY_NAME', 'Employee Attendance System')
+WORK_HOURS_PER_DAY = float(os.environ.get('WORK_HOURS_PER_DAY', '8'))
 
+
+def build_export_rows(data, filter_date=None):
     rows = []
-    for r in data['attendance']:
+    for r in sorted(data['attendance'], key=lambda x: (x['date'], x.get('clock_in') or '')):
         if filter_date and r['date'] != filter_date:
             continue
+        if r.get('clock_out'):
+            h = hours_between(r['date'], r.get('clock_in'), r['clock_out'])
+            hours, status = (round(h, 2), 'Completed') if h is not None else (None, 'Check times')
+        else:
+            hours, status = None, 'In Progress'
+        try:
+            day_name = datetime.strptime(r['date'], '%Y-%m-%d').strftime('%A')
+        except Exception:
+            day_name = ''
         rows.append({
-            'date': r['date'],
-            'employee_id': r['employee_id'],
-            'employee_name': r.get('employee_name', ''),
-            'department': r.get('department', ''),
-            'clock_in': r.get('clock_in', ''),
-            'clock_out': r.get('clock_out', '')
+            'date': r['date'], 'day': day_name, 'emp_id': r['employee_id'],
+            'name': r.get('employee_name', ''), 'dept': r.get('department', ''),
+            'clock_in': r.get('clock_in') or '', 'clock_out': r.get('clock_out') or '',
+            'hours': hours, 'status': status,
         })
+    return rows
+
+
+def build_excel(rows, filter_date):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    NAVY, BAND, WHITE = '1F3864', 'F2F5FA', 'FFFFFF'
+    thin = Side(style='thin', color='BFC7D5')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_font = Font(name='Calibri', bold=True, color=WHITE, size=11)
+    head_fill = PatternFill('solid', fgColor=NAVY)
+    center = Alignment(horizontal='center', vertical='center')
+    left = Alignment(horizontal='left', vertical='center')
+
+    if filter_date:
+        period = datetime.strptime(filter_date, '%Y-%m-%d').strftime('%d %B %Y')
+    elif rows:
+        d1 = datetime.strptime(rows[0]['date'], '%Y-%m-%d').strftime('%d %b %Y')
+        d2 = datetime.strptime(rows[-1]['date'], '%Y-%m-%d').strftime('%d %b %Y')
+        period = d1 if d1 == d2 else f'{d1} - {d2}'
+    else:
+        period = 'No records'
+    generated = now_local().strftime('%d %B %Y, %I:%M %p')
+
+    def title_block(ws, title, last_col):
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=last_col)
+        ws['A1'] = COMPANY_NAME
+        ws['A1'].font = Font(name='Calibri', bold=True, size=18, color=NAVY)
+        ws['A2'] = title
+        ws['A2'].font = Font(name='Calibri', bold=True, size=13, color='444444')
+        ws['A3'] = f'Period: {period}     |     Generated: {generated}'
+        ws['A3'].font = Font(name='Calibri', italic=True, size=10, color='666666')
+        ws.row_dimensions[1].height = 28
+        for r in (1, 2, 3):
+            ws.cell(row=r, column=1).alignment = left
+
+    def header_row(ws, row, headers):
+        for i, h in enumerate(headers, 1):
+            c = ws.cell(row=row, column=i, value=h)
+            c.font, c.fill, c.alignment, c.border = head_font, head_fill, center, border
+        ws.row_dimensions[row].height = 22
+
+    def page_setup(ws, header_row_num):
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = f'{header_row_num}:{header_row_num}'
+        ws.oddFooter.center.text = 'Page &P of &N'
+        ws.sheet_view.showGridLines = False
+
+    wb = Workbook()
+
+    # ---------------- Sheet 1: Daily attendance ----------------
+    ws = wb.active
+    ws.title = 'Attendance'
+    headers = ['Date', 'Day', 'Employee ID', 'Employee Name', 'Department',
+               'Clock In', 'Clock Out', 'Hours Worked', 'Status']
+    title_block(ws, 'Daily Attendance Report', len(headers))
+    HR = 5
+    header_row(ws, HR, headers)
+
+    status_style = {
+        'Completed': ('1E7B34', 'E6F4EA'),
+        'In Progress': ('9A6700', 'FFF4CE'),
+        'Check times': ('B42318', 'FDE8E8'),
+    }
+    r = HR
+    for i, row in enumerate(rows):
+        r += 1
+        vals = [
+            datetime.strptime(row['date'], '%Y-%m-%d').date(), row['day'], row['emp_id'],
+            row['name'], row['dept'],
+            datetime.strptime(row['clock_in'], '%H:%M:%S').time() if row['clock_in'] else None,
+            datetime.strptime(row['clock_out'], '%H:%M:%S').time() if row['clock_out'] else None,
+            row['hours'], row['status'],
+        ]
+        for col, v in enumerate(vals, 1):
+            c = ws.cell(row=r, column=col, value=v)
+            c.border = border
+            c.font = Font(name='Calibri', size=11)
+            c.alignment = left if col in (4, 5) else center
+            if i % 2 == 1:
+                c.fill = PatternFill('solid', fgColor=BAND)
+        ws.cell(row=r, column=1).number_format = 'dd-mmm-yyyy'
+        ws.cell(row=r, column=6).number_format = 'hh:mm AM/PM'
+        ws.cell(row=r, column=7).number_format = 'hh:mm AM/PM'
+        ws.cell(row=r, column=8).number_format = '0.00'
+        fg, bg = status_style[row['status']]
+        sc = ws.cell(row=r, column=9)
+        sc.font = Font(name='Calibri', bold=True, size=11, color=fg)
+        sc.fill = PatternFill('solid', fgColor=bg)
+
+    first, last = HR + 1, r
+    if rows:
+        r += 1
+        ws.cell(row=r, column=1, value='TOTAL')
+        ws.cell(row=r, column=8, value=f'=SUBTOTAL(109,H{first}:H{last})')
+        ws.cell(row=r, column=9, value=f'=SUBTOTAL(103,A{first}:A{last})&" records"')
+        for col in range(1, len(headers) + 1):
+            c = ws.cell(row=r, column=col)
+            c.font = Font(name='Calibri', bold=True, size=11, color=NAVY)
+            c.fill = PatternFill('solid', fgColor='DCE3F0')
+            c.border = Border(top=Side(style='medium', color=NAVY), bottom=thin, left=thin, right=thin)
+            c.alignment = center
+        ws.cell(row=r, column=8).number_format = '0.00'
+        ws.auto_filter.ref = f'A{HR}:{get_column_letter(len(headers))}{last}'
+    ws.freeze_panes = ws.cell(row=HR + 1, column=1)
+    for i, w in enumerate([14, 13, 14, 24, 18, 12, 12, 14, 14], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    page_setup(ws, HR)
+
+    # ---------------- Sheet 2: Summary per employee ----------------
+    ws2 = wb.create_sheet('Summary')
+    summary = {}
+    for row in rows:
+        e = summary.setdefault(row['emp_id'], {'name': row['name'], 'dept': row['dept'],
+                                               'days': 0, 'hours': 0.0})
+        if row['status'] == 'Completed':
+            e['days'] += 1
+            e['hours'] += row['hours']
+    sh = ['Employee ID', 'Employee Name', 'Department', 'Days Present', 'Total Hours',
+          'Avg Hours / Day', f'Expected Hours ({WORK_HOURS_PER_DAY:g}h/day)', 'Difference']
+    title_block(ws2, 'Employee Summary', len(sh))
+    header_row(ws2, HR, sh)
+    r = HR
+    for i, (eid, e) in enumerate(sorted(summary.items())):
+        r += 1
+        expected = e['days'] * WORK_HOURS_PER_DAY
+        avg = e['hours'] / e['days'] if e['days'] else 0
+        vals = [eid, e['name'], e['dept'], e['days'], round(e['hours'], 2),
+                round(avg, 2), round(expected, 2), round(e['hours'] - expected, 2)]
+        for col, v in enumerate(vals, 1):
+            c = ws2.cell(row=r, column=col, value=v)
+            c.border = border
+            c.font = Font(name='Calibri', size=11)
+            c.alignment = left if col in (2, 3) else center
+            if i % 2 == 1:
+                c.fill = PatternFill('solid', fgColor=BAND)
+            if col >= 5:
+                c.number_format = '0.00'
+        diff = ws2.cell(row=r, column=8)
+        diff.number_format = '+0.00;-0.00;0.00'
+        diff.font = Font(name='Calibri', bold=True, size=11,
+                         color='1E7B34' if vals[7] >= 0 else 'B42318')
+    if summary:
+        first2, last2 = HR + 1, r
+        r += 1
+        ws2.cell(row=r, column=1, value='TOTAL')
+        for col in (4, 5, 7, 8):
+            L = get_column_letter(col)
+            ws2.cell(row=r, column=col, value=f'=SUM({L}{first2}:{L}{last2})')
+        for col in range(1, len(sh) + 1):
+            c = ws2.cell(row=r, column=col)
+            c.font = Font(name='Calibri', bold=True, size=11, color=NAVY)
+            c.fill = PatternFill('solid', fgColor='DCE3F0')
+            c.border = Border(top=Side(style='medium', color=NAVY), bottom=thin, left=thin, right=thin)
+            c.alignment = center
+            if col >= 5:
+                c.number_format = '0.00'
+    ws2.freeze_panes = ws2.cell(row=HR + 1, column=1)
+    for i, w in enumerate([14, 24, 18, 14, 14, 16, 26, 14], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    page_setup(ws2, HR)
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+@app.route('/export')
+def export_file():
+    data = load_data()
+    filter_date = request.args.get('date')
+    fmt = request.args.get('format', 'xlsx')
+    rows = build_export_rows(data, filter_date)
+    base_name = f"attendance_report_{filter_date or 'all'}"
+
+    if fmt != 'csv':
+        try:
+            output = build_excel(rows, filter_date)
+            return send_file(
+                output,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True, download_name=base_name + '.xlsx')
+        except ImportError:
+            pass  # openpyxl not installed -> fall back to CSV below
 
     si = io.StringIO()
-    writer = csv.DictWriter(si, fieldnames=['date','employee_id','employee_name','department','clock_in','clock_out'])
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(row)
+    writer = csv.writer(si)
+    writer.writerow(['Date', 'Day', 'Employee ID', 'Employee Name', 'Department',
+                     'Clock In', 'Clock Out', 'Hours Worked', 'Status'])
+    for x in rows:
+        writer.writerow([x['date'], x['day'], x['emp_id'], x['name'], x['dept'],
+                         x['clock_in'], x['clock_out'],
+                         '' if x['hours'] is None else x['hours'], x['status']])
     output = io.BytesIO()
+    output.write(b'\xef\xbb\xbf')  # BOM so Excel reads the file correctly
     output.write(si.getvalue().encode('utf-8'))
     output.seek(0)
-
-    filename = f"attendance_export_{filter_date or 'all'}.csv"
-    return send_file(output, mimetype='text/csv', as_attachment=True, download_name=filename)
+    return send_file(output, mimetype='text/csv', as_attachment=True,
+                     download_name=base_name + '.csv')
 
 
 @app.route('/health')
