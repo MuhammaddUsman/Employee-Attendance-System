@@ -10,7 +10,6 @@ import hmac
 import base64
 import urllib.request
 from functools import wraps
-from werkzeug.security import generate_password_hash, check_password_hash
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -407,10 +406,6 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
                     {% endfor %}
                 </select>
             </div>
-            <div class="form-group">
-                <label>Your PIN:</label>
-                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" autocomplete="off" required placeholder="Enter your PIN">
-            </div>
             <div class="button-group">
                 <button type="submit" name="action" value="in" class="btn btn-success">Clock In</button>
                 <button type="submit" name="action" value="out" class="btn btn-danger">Clock Out</button>
@@ -470,10 +465,6 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
                 <label>Position:</label>
                 <input type="text" name="position" required placeholder="e.g., Manager, Developer">
             </div>
-            <div class="form-group">
-                <label>Employee PIN (4-6 digits):</label>
-                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" required autocomplete="new-password" placeholder="e.g., 4821">
-            </div>
             <button type="submit" class="btn">Add Employee</button>
         </form>
         {% else %}
@@ -498,17 +489,12 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
                 {% for emp_id, emp in employees.items() %}
                 <tr>
                     <td><strong>{{ emp_id }}</strong></td>
-                    <td>{{ emp.name }}{% if is_admin and not emp.pin_hash %} <span class="status-out" style="color:#b91c1c;background:#fee2e2;">No PIN</span>{% endif %}</td>
+                    <td>{{ emp.name }}</td>
                     <td>{{ emp.department }}</td>
                     <td>{{ emp.position }}</td>
                     <td>{{ emp.join_date }}</td>
                     <td>
                         {% if is_admin %}
-                            <form method="POST" action="/set_pin" style="display:inline-flex;gap:6px;align-items:center;">
-                                <input type="hidden" name="emp_id" value="{{ emp_id }}">
-                                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" required autocomplete="new-password" placeholder="New PIN" style="width:100px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;">
-                                <button type="submit" class="btn" style="padding:7px 12px;">Set PIN</button>
-                            </form>
                             <form method="POST" action="/delete_employee" style="display:inline;" onsubmit="return confirm('Delete this employee and all of their attendance records?');">
                                 <input type="hidden" name="emp_id" value="{{ emp_id }}">
                                 <button type="submit" class="btn btn-danger" style="margin-left:6px;padding:7px 12px;">Delete</button>
@@ -705,10 +691,6 @@ def valid_date(text):
         return False
 
 
-def valid_pin(pin):
-    return bool(re.fullmatch(r'[0-9]{4,6}', pin or ''))
-
-
 def safe_next(url):
     if url and url.startswith('/') and not url.startswith('//') and '\\' not in url:
         return url
@@ -771,46 +753,14 @@ def index():
                                  is_admin=session.get('is_admin', False))
 
 
-MAX_PIN_FAILS = 5
-LOCK_SECONDS = 300
-
-
-def check_pin(emp_id, emp, pin):
-    # returns an error message, or None when the PIN is correct
-    if not emp.get('pin_hash'):
-        return 'No PIN is set for this employee. Please ask the admin to set one.'
-    now_ts = time.time()
-    if emp.get('locked_until', 0) > now_ts:
-        mins = int((emp['locked_until'] - now_ts) // 60) + 1
-        return f'Too many wrong attempts. Try again in {mins} minute(s).'
-    if not pin or not check_password_hash(emp['pin_hash'], pin):
-        emp['fails'] = emp.get('fails', 0) + 1
-        if emp['fails'] >= MAX_PIN_FAILS:
-            emp['fails'] = 0
-            emp['locked_until'] = now_ts + LOCK_SECONDS
-            store_set_employee(emp_id, emp)
-            return 'Too many wrong attempts. This employee is locked for 5 minutes.'
-        store_set_employee(emp_id, emp)
-        return f'Incorrect PIN. {MAX_PIN_FAILS - emp["fails"]} attempt(s) left.'
-    if emp.get('fails') or emp.get('locked_until'):
-        emp['fails'] = 0
-        emp['locked_until'] = 0
-        store_set_employee(emp_id, emp)
-    return None
-
-
 @app.route('/clock', methods=['POST'])
 def clock():
     employee_id = request.form.get('employee_id', '')
     action = request.form.get('action')
-    pin = request.form.get('pin', '').strip()
 
     emp = store_get_employee(employee_id) if employee_id else None
     if not emp:
         return redirect(url_for('index', message='Employee not found', success=0))
-    err = check_pin(employee_id, emp, pin)
-    if err:
-        return redirect(url_for('index', message=err, success=0))
 
     now = now_local()
     today = now.strftime('%Y-%m-%d')
@@ -856,42 +806,20 @@ def add_employee():
     name = request.form.get('name', '').strip()
     department = request.form.get('department', '').strip()
     position = request.form.get('position', '').strip()
-    pin = request.form.get('pin', '').strip()
 
     if not name or not department or not position:
         return redirect(url_for('employees', message='All fields are required'))
-    if not valid_pin(pin):
-        return redirect(url_for('employees', message='PIN must be 4 to 6 digits'))
-
     emp = {
         'name': name,
         'department': department,
         'position': position,
         'join_date': now_local().strftime('%Y-%m-%d'),
-        'pin_hash': generate_password_hash(pin, method='pbkdf2:sha256'),
     }
     for _ in range(10):
         emp_id = f'EMP{next_counter():03d}'
         if store_create_employee(emp_id, emp):
             return redirect(url_for('employees', message=f'Employee {name} added successfully!'))
     return redirect(url_for('employees', message='Could not create the employee, please try again'))
-
-
-@app.route('/set_pin', methods=['POST'])
-@admin_required
-def set_pin():
-    emp_id = request.form.get('emp_id', '')
-    pin = request.form.get('pin', '').strip()
-    emp = store_get_employee(emp_id)
-    if not emp:
-        return redirect(url_for('employees', message='Employee not found'))
-    if not valid_pin(pin):
-        return redirect(url_for('employees', message='PIN must be 4 to 6 digits'))
-    emp['pin_hash'] = generate_password_hash(pin, method='pbkdf2:sha256')
-    emp['fails'] = 0
-    emp['locked_until'] = 0
-    store_set_employee(emp_id, emp)
-    return redirect(url_for('employees', message=f'PIN updated for {emp["name"]}'))
 
 
 @app.route('/delete_employee', methods=['POST'])
