@@ -5,10 +5,19 @@ import os
 import csv
 import re
 import io
+import time
+import hmac
 import urllib.request
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=bool(os.environ.get('VERCEL')),
+)
 
 app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_change_me')
 
@@ -23,47 +32,202 @@ REDIS_KEY = 'attendance_data'
 DATA_FILE = os.path.join('/tmp' if os.environ.get('VERCEL') else '.', 'attendance_data.json')
 
 
-def EMPTY():
-    return {'employees': {}, 'attendance': []}
+P_EMP, P_ATT = 'att:employees', 'att:attendance'
+K_CNT, K_MIG = 'att:emp_counter', 'att:migrated'
+_migrated = False
 
 
 def now_local():
     return datetime.now(TIMEZONE)
 
 
-def _redis(path, body=None):
+def _use_redis():
+    return bool(REDIS_URL and REDIS_TOKEN)
+
+
+def _cmd(*args):
     req = urllib.request.Request(
-        f"{REDIS_URL.rstrip('/')}/{path}",
-        data=body,
-        headers={'Authorization': f'Bearer {REDIS_TOKEN}'},
-        method='POST' if body is not None else 'GET',
+        REDIS_URL.rstrip('/'),
+        data=json.dumps(list(args)).encode('utf-8'),
+        headers={'Authorization': f'Bearer {REDIS_TOKEN}', 'Content-Type': 'application/json'},
+        method='POST',
     )
     with urllib.request.urlopen(req, timeout=8) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+        out = json.loads(resp.read().decode('utf-8'))
+    if isinstance(out, dict) and out.get('error'):
+        raise RuntimeError(out['error'])
+    return out.get('result')
+
+
+def _emp_num(eid):
+    m = re.fullmatch(r'EMP(\d+)', eid or '')
+    return int(m.group(1)) if m else 0
+
+
+# ---- local JSON file (development only) ----
+def _local_load():
+    d = {}
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+    if isinstance(d.get('attendance'), list) or (isinstance(d.get('employees'), dict) and P_EMP not in d):
+        old, d = d, {P_EMP: {}, P_ATT: {}, K_CNT: {}}   # convert the old single-blob format
+        for eid, e in (old.get('employees') or {}).items():
+            d[P_EMP][eid] = json.dumps(e)
+        for r in old.get('attendance') or []:
+            d[P_ATT].setdefault(f"{r['date']}:{r['employee_id']}", json.dumps(r))
+        d[K_CNT]['v'] = str(max([_emp_num(e) for e in d[P_EMP]] or [0]))
+    for k in (P_EMP, P_ATT, K_CNT):
+        d.setdefault(k, {})
+    return d
+
+
+def _local_save(d):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(d, f, indent=1)
+
+
+# ---- one-time move from the old single-key storage to per-record storage ----
+def ensure_migrated():
+    global _migrated
+    if _migrated or not _use_redis():
+        return
+    if _cmd('GET', K_MIG) is None:
+        raw = _cmd('GET', REDIS_KEY)           # the old blob is kept as a backup
+        if raw:
+            old = json.loads(raw)
+            emps = old.get('employees') or {}
+            if emps:
+                args = []
+                for eid, e in emps.items():
+                    args += [eid, json.dumps(e)]
+                _cmd('HSET', P_EMP, *args)
+            recs = {}
+            for r in old.get('attendance') or []:
+                recs.setdefault(f"{r['date']}:{r['employee_id']}", json.dumps(r))
+            if recs:
+                args = []
+                for k, v in recs.items():
+                    args += [k, v]
+                _cmd('HSET', P_ATT, *args)
+            _cmd('SETNX', K_CNT, str(max([_emp_num(e) for e in emps] or [0])))
+        _cmd('SET', K_MIG, '1')
+    _migrated = True
+
+
+# ---- hash primitives (same behaviour on Redis and on the local file) ----
+def h_getall(name):
+    if _use_redis():
+        ensure_migrated()
+        res = _cmd('HGETALL', name) or []
+        if isinstance(res, dict):
+            return res
+        return {res[i]: res[i + 1] for i in range(0, len(res), 2)}
+    return dict(_local_load()[name])
+
+
+def h_get(name, field):
+    if _use_redis():
+        ensure_migrated()
+        return _cmd('HGET', name, field)
+    return _local_load()[name].get(field)
+
+
+def h_set(name, field, value):
+    if _use_redis():
+        ensure_migrated()
+        _cmd('HSET', name, field, value)
+        return
+    d = _local_load()
+    d[name][field] = value
+    _local_save(d)
+
+
+def h_setnx(name, field, value):
+    # atomic "create only if it does not exist"
+    if _use_redis():
+        ensure_migrated()
+        return _cmd('HSETNX', name, field, value) == 1
+    d = _local_load()
+    if field in d[name]:
+        return False
+    d[name][field] = value
+    _local_save(d)
+    return True
+
+
+def h_del(name, *fields):
+    if not fields:
+        return
+    if _use_redis():
+        ensure_migrated()
+        _cmd('HDEL', name, *fields)
+        return
+    d = _local_load()
+    for f in fields:
+        d[name].pop(f, None)
+    _local_save(d)
+
+
+def next_counter():
+    if _use_redis():
+        ensure_migrated()
+        return int(_cmd('INCR', K_CNT))
+    d = _local_load()
+    n = int(d[K_CNT].get('v', '0')) + 1
+    d[K_CNT]['v'] = str(n)
+    _local_save(d)
+    return n
+
+
+# ---- employees and records ----
+def rec_key(date, emp_id):
+    return f'{date}:{emp_id}'
+
+
+def store_get_employee(eid):
+    v = h_get(P_EMP, eid)
+    return json.loads(v) if v else None
+
+
+def store_set_employee(eid, emp):
+    h_set(P_EMP, eid, json.dumps(emp))
+
+
+def store_create_employee(eid, emp):
+    return h_setnx(P_EMP, eid, json.dumps(emp))
+
+
+def store_delete_employee(eid):
+    h_del(P_EMP, eid)
+    h_del(P_ATT, *[k for k in h_getall(P_ATT) if k.endswith(':' + eid)])
+
+
+def store_get_record(date, eid):
+    v = h_get(P_ATT, rec_key(date, eid))
+    return json.loads(v) if v else None
+
+
+def store_set_record(rec):
+    h_set(P_ATT, rec_key(rec['date'], rec['employee_id']), json.dumps(rec))
+
+
+def store_create_record(rec):
+    return h_setnx(P_ATT, rec_key(rec['date'], rec['employee_id']), json.dumps(rec))
+
+
+def store_delete_record(date, eid):
+    h_del(P_ATT, rec_key(date, eid))
 
 
 def load_data():
-    if REDIS_URL and REDIS_TOKEN:
-        # No try/except on purpose: if Redis fails we want an error,
-        # not an empty list that would overwrite real data on the next save.
-        raw = _redis(f'get/{REDIS_KEY}').get('result')
-        return json.loads(raw) if raw else EMPTY()
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return EMPTY()
-    return EMPTY()
-
-
-def save_data(data):
-    payload = json.dumps(data, indent=2, sort_keys=True)
-    if REDIS_URL and REDIS_TOKEN:
-        _redis(f'set/{REDIS_KEY}', payload.encode('utf-8'))
-        return
-    with open(DATA_FILE, 'w') as f:
-        f.write(payload)
+    employees = {k: json.loads(v) for k, v in h_getall(P_EMP).items()}
+    attendance = [json.loads(v) for v in h_getall(P_ATT).values()]
+    attendance.sort(key=lambda r: (r['date'], r.get('clock_in') or ''))
+    return {'employees': employees, 'attendance': attendance}
 
 
 BASE_TEMPLATE = r'''
@@ -126,9 +290,11 @@ BASE_TEMPLATE = r'''
         <div class="nav">
             <a href="/" class="{{ 'active' if p == '/' }}">Clock In/Out</a>
             <a href="/employees" class="{{ 'active' if p == '/employees' }}">Employees</a>
+            {% if is_admin %}
             <a href="/records" class="{{ 'active' if p == '/records' }}">Attendance Records</a>
             <a href="/reports" class="{{ 'active' if p == '/reports' }}">Reports</a>
             <a href="/export">Export Excel</a>
+            {% endif %}
             {% if is_admin %}<a href="/logout">Logout</a>{% else %}<a href="/login" class="{{ 'active' if p == '/login' }}">Admin Login</a>{% endif %}
         </div>
     </div></div>
@@ -164,6 +330,7 @@ LOGIN_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
             <div class="error-msg">{{ message }}</div>
         {% endif %}
         <form method="POST" action="/login">
+            <input type="hidden" name="next" value="{{ next or '' }}">
             <div class="form-group">
                 <label>Admin Password:</label>
                 <input type="password" name="password" required placeholder="Enter admin password">
@@ -201,6 +368,10 @@ HOME_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
                     <option value="{{ emp_id }}">{{ emp.name }} ({{ emp.department }})</option>
                     {% endfor %}
                 </select>
+            </div>
+            <div class="form-group">
+                <label>Your PIN:</label>
+                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" autocomplete="off" required placeholder="Enter your PIN">
             </div>
             <div class="button-group">
                 <button type="submit" name="action" value="in" class="btn btn-success">Clock In</button>
@@ -247,6 +418,7 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
         {% if message %}
         <div class="success-msg">{{ message }}</div>
         {% endif %}
+        {% if is_admin %}
         <form method="POST" action="/add_employee">
             <div class="form-group">
                 <label>Employee Name:</label>
@@ -260,8 +432,15 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
                 <label>Position:</label>
                 <input type="text" name="position" required placeholder="e.g., Manager, Developer">
             </div>
+            <div class="form-group">
+                <label>Employee PIN (4-6 digits):</label>
+                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" required autocomplete="new-password" placeholder="e.g., 4821">
+            </div>
             <button type="submit" class="btn">Add Employee</button>
         </form>
+        {% else %}
+        <p style="color:#64748b;">Only an admin can add employees. <a href="/login?next=/employees">Admin login</a></p>
+        {% endif %}
     </div>
     
     <div class="card">
@@ -281,16 +460,20 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
                 {% for emp_id, emp in employees.items() %}
                 <tr>
                     <td><strong>{{ emp_id }}</strong></td>
-                    <td>{{ emp.name }}</td>
+                    <td>{{ emp.name }}{% if is_admin and not emp.pin_hash %} <span class="status-out" style="color:#b91c1c;background:#fee2e2;">No PIN</span>{% endif %}</td>
                     <td>{{ emp.department }}</td>
                     <td>{{ emp.position }}</td>
                     <td>{{ emp.join_date }}</td>
                     <td>
                         {% if is_admin %}
-                            <!-- Admin logged in: show delete button -->
-                            <form method="POST" action="/delete_employee" style="display:inline;">
+                            <form method="POST" action="/set_pin" style="display:inline-flex;gap:6px;align-items:center;">
                                 <input type="hidden" name="emp_id" value="{{ emp_id }}">
-                                <button type="submit" class="btn btn-danger" style="margin-left:8px; padding:8px 12px;">Delete</button>
+                                <input type="password" name="pin" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" required autocomplete="new-password" placeholder="New PIN" style="width:100px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:8px;">
+                                <button type="submit" class="btn" style="padding:7px 12px;">Set PIN</button>
+                            </form>
+                            <form method="POST" action="/delete_employee" style="display:inline;" onsubmit="return confirm('Delete this employee and all of their attendance records?');">
+                                <input type="hidden" name="emp_id" value="{{ emp_id }}">
+                                <button type="submit" class="btn btn-danger" style="margin-left:6px;padding:7px 12px;">Delete</button>
                             </form>
                         {% else %}
                             <!-- Non-admin: no delete option -->
@@ -308,6 +491,8 @@ EMPLOYEES_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', 
 RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
     <div class="card">
         <h2 class="page-title">Attendance Records</h2>
+        {% if message %}<div class="success-msg">{{ message }}</div>{% endif %}
+        <p style="margin-bottom:16px;"><a href="/edit_record" class="btn">+ Add / Correct Record</a></p>
         <form method="GET" action="/records" style="margin-bottom:16px;">
             <label>Filter by date:</label>
             <input type="date" name="date" value="{{ filter_date or '' }}" style="padding:8px;border-radius:8px;border:1px solid #e2e8f0;margin-left:8px;">
@@ -328,6 +513,7 @@ RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
                     <th>Clock In</th>
                     <th>Clock Out</th>
                     <th>Time Worked</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -339,10 +525,63 @@ RECORDS_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', ''
                     <td>{{ record.clock_in }}</td>
                     <td>{{ record.clock_out or '-' }}</td>
                     <td>{{ record.hours_worked }}</td>
+                    <td>
+                        <a href="/edit_record?date={{ record.date }}&emp_id={{ record.employee_id }}" class="btn" style="padding:6px 12px;">Edit</a>
+                        <form method="POST" action="/delete_record" style="display:inline;" onsubmit="return confirm('Delete this record?');">
+                            <input type="hidden" name="date" value="{{ record.date }}">
+                            <input type="hidden" name="emp_id" value="{{ record.employee_id }}">
+                            <button type="submit" class="btn btn-danger" style="padding:6px 12px;">Delete</button>
+                        </form>
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
+    </div>
+''')
+
+
+EDIT_TEMPLATE = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
+    <div class="card" style="max-width:560px;margin:0 auto;">
+        <h2 class="page-title">{{ 'Edit Record' if editing else 'Add / Correct Record' }}</h2>
+        {% if message %}<div class="error-msg">{{ message }}</div>{% endif %}
+        <form method="POST" action="/save_record">
+            <div class="form-group">
+                <label>Employee:</label>
+                {% if editing %}
+                <input type="hidden" name="emp_id" value="{{ emp_id }}">
+                <input type="text" value="{{ employees[emp_id].name if emp_id in employees else emp_id }}" disabled>
+                {% else %}
+                <select name="emp_id" required>
+                    <option value="">-- Choose Employee --</option>
+                    {% for eid, e in employees.items() %}
+                    <option value="{{ eid }}" {{ 'selected' if eid == emp_id }}>{{ e.name }} ({{ e.department }})</option>
+                    {% endfor %}
+                </select>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                <label>Date:</label>
+                {% if editing %}
+                <input type="hidden" name="date" value="{{ date }}">
+                <input type="text" value="{{ date }}" disabled>
+                {% else %}
+                <input type="date" name="date" value="{{ date }}" required>
+                {% endif %}
+            </div>
+            <div class="form-group">
+                <label>Clock In:</label>
+                <input type="time" step="1" name="clock_in" value="{{ clock_in }}" required>
+            </div>
+            <div class="form-group">
+                <label>Clock Out (leave empty if still working):</label>
+                <input type="time" step="1" name="clock_out" value="{{ clock_out }}">
+            </div>
+            <div style="display:flex;gap:10px;">
+                <button type="submit" class="btn btn-success">Save</button>
+                <a href="/records" class="btn" style="background:#64748b;">Cancel</a>
+            </div>
+        </form>
     </div>
 ''')
 
@@ -404,22 +643,51 @@ def format_duration(hours, signed=False):
     return text
 
 
-def next_employee_id(employees):
-    max_n = 0
-    for eid in employees.keys():
-        if eid.startswith('EMP'):
-            try:
-                n = int(eid[3:])
-                if n > max_n:
-                    max_n = n
-            except ValueError:
-                continue
-    return f"EMP{max_n + 1:03d}"
-
 def parse_bool_param(val):
     if val is None:
         return None
     return str(val) in ('1', 'true', 'True', 'yes', 'Yes')
+
+
+def parse_time(text):
+    text = (text or '').strip()
+    for fmt in ('%H:%M:%S', '%H:%M'):
+        try:
+            return datetime.strptime(text, fmt).strftime('%H:%M:%S')
+        except ValueError:
+            pass
+    return None
+
+
+def valid_date(text):
+    try:
+        datetime.strptime(text or '', '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
+def valid_pin(pin):
+    return bool(re.fullmatch(r'[0-9]{4,6}', pin or ''))
+
+
+def safe_next(url):
+    if url and url.startswith('/') and not url.startswith('//') and '\\' not in url:
+        return url
+    return None
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get('is_admin'):
+            if request.method == 'GET':
+                target = request.full_path if request.query_string else request.path
+            else:
+                target = url_for('employees')
+            return redirect(url_for('login', next=target))
+        return f(*args, **kwargs)
+    return wrapper
 
 
 @app.context_processor
@@ -429,14 +697,16 @@ def inject_company():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    nxt = safe_next(request.values.get('next'))
     if request.method == 'POST':
         pwd = request.form.get('password', '')
-        if pwd == ADMIN_PASSWORD:
+        if hmac.compare_digest(pwd.encode('utf-8'), ADMIN_PASSWORD.encode('utf-8')):
             session['is_admin'] = True
-            return redirect(url_for('employees'))
-        else:
-            return render_template_string(LOGIN_TEMPLATE, message='Invalid password', is_admin=False)
-    return render_template_string(LOGIN_TEMPLATE, is_admin=session.get('is_admin', False))
+            return redirect(nxt or url_for('employees'))
+        time.sleep(1)  # slows down password guessing
+        return render_template_string(LOGIN_TEMPLATE, message='Invalid password', next=nxt, is_admin=False)
+    return render_template_string(LOGIN_TEMPLATE, next=nxt, is_admin=session.get('is_admin', False))
+
 
 @app.route('/logout')
 def logout():
@@ -462,53 +732,78 @@ def index():
                                  completed_today=sum(1 for r in today_records if r.get('clock_out')),
                                  is_admin=session.get('is_admin', False))
 
+
+MAX_PIN_FAILS = 5
+LOCK_SECONDS = 300
+
+
+def check_pin(emp_id, emp, pin):
+    # returns an error message, or None when the PIN is correct
+    if not emp.get('pin_hash'):
+        return 'No PIN is set for this employee. Please ask the admin to set one.'
+    now_ts = time.time()
+    if emp.get('locked_until', 0) > now_ts:
+        mins = int((emp['locked_until'] - now_ts) // 60) + 1
+        return f'Too many wrong attempts. Try again in {mins} minute(s).'
+    if not pin or not check_password_hash(emp['pin_hash'], pin):
+        emp['fails'] = emp.get('fails', 0) + 1
+        if emp['fails'] >= MAX_PIN_FAILS:
+            emp['fails'] = 0
+            emp['locked_until'] = now_ts + LOCK_SECONDS
+            store_set_employee(emp_id, emp)
+            return 'Too many wrong attempts. This employee is locked for 5 minutes.'
+        store_set_employee(emp_id, emp)
+        return f'Incorrect PIN. {MAX_PIN_FAILS - emp["fails"]} attempt(s) left.'
+    if emp.get('fails') or emp.get('locked_until'):
+        emp['fails'] = 0
+        emp['locked_until'] = 0
+        store_set_employee(emp_id, emp)
+    return None
+
+
 @app.route('/clock', methods=['POST'])
 def clock():
-    data = load_data()
-    employee_id = request.form.get('employee_id')
+    employee_id = request.form.get('employee_id', '')
     action = request.form.get('action')
+    pin = request.form.get('pin', '').strip()
+
+    emp = store_get_employee(employee_id) if employee_id else None
+    if not emp:
+        return redirect(url_for('index', message='Employee not found', success=0))
+    err = check_pin(employee_id, emp, pin)
+    if err:
+        return redirect(url_for('index', message=err, success=0))
+
     now = now_local()
     today = now.strftime('%Y-%m-%d')
 
-    if not employee_id or employee_id not in data['employees']:
-        return redirect(url_for('index', message='Employee not found', success=0))
-
-    employee = data['employees'][employee_id]
-
-    today_record = None
-    for record in data['attendance']:
-        if record['employee_id'] == employee_id and record['date'] == today:
-            today_record = record
-            break
-
     if action == 'in':
-        if today_record and not today_record.get('clock_out') and today_record.get('clock_in'):
-            return redirect(url_for('index', message='Already clocked in!', success=0))
-
-        new_record = {
+        rec = {
             'employee_id': employee_id,
-            'employee_name': employee['name'],
-            'department': employee['department'],
+            'employee_name': emp['name'],
+            'department': emp['department'],
             'date': today,
             'clock_in': now.strftime('%H:%M:%S'),
-            'clock_out': None
+            'clock_out': None,
         }
-        data['attendance'].append(new_record)
-        save_data(data)
-        return redirect(url_for('index', message=f'{employee["name"]} clocked in successfully!', success=1))
+        if store_create_record(rec):   # atomic: a second click cannot create a duplicate
+            return redirect(url_for('index', message=f'{emp["name"]} clocked in successfully!', success=1))
+        existing = store_get_record(today, employee_id) or {}
+        msg = 'Already clocked out for today.' if existing.get('clock_out') else 'Already clocked in!'
+        return redirect(url_for('index', message=msg, success=0))
 
-    elif action == 'out':
-        if not today_record:
+    if action == 'out':
+        rec = store_get_record(today, employee_id)
+        if not rec:
             return redirect(url_for('index', message='No clock-in record found!', success=0))
-
-        if today_record.get('clock_out'):
+        if rec.get('clock_out'):
             return redirect(url_for('index', message='Already clocked out!', success=0))
-
-        today_record['clock_out'] = now.strftime('%H:%M:%S')
-        save_data(data)
-        return redirect(url_for('index', message=f'{employee["name"]} clocked out successfully!', success=1))
+        rec['clock_out'] = now.strftime('%H:%M:%S')
+        store_set_record(rec)
+        return redirect(url_for('index', message=f'{emp["name"]} clocked out successfully!', success=1))
 
     return redirect(url_for('index', message='Invalid action', success=0))
+
 
 @app.route('/employees')
 def employees():
@@ -516,44 +811,63 @@ def employees():
     message = request.args.get('message')
     return render_template_string(EMPLOYEES_TEMPLATE, employees=data['employees'], message=message, is_admin=session.get('is_admin', False))
 
+
 @app.route('/add_employee', methods=['POST'])
+@admin_required
 def add_employee():
-    data = load_data()
     name = request.form.get('name', '').strip()
     department = request.form.get('department', '').strip()
     position = request.form.get('position', '').strip()
+    pin = request.form.get('pin', '').strip()
 
     if not name or not department or not position:
         return redirect(url_for('employees', message='All fields are required'))
+    if not valid_pin(pin):
+        return redirect(url_for('employees', message='PIN must be 4 to 6 digits'))
 
-    emp_id = next_employee_id(data['employees'])
-    data['employees'][emp_id] = {
+    emp = {
         'name': name,
         'department': department,
         'position': position,
-        'join_date': now_local().strftime('%Y-%m-%d')
+        'join_date': now_local().strftime('%Y-%m-%d'),
+        'pin_hash': generate_password_hash(pin, method='pbkdf2:sha256'),
     }
-    save_data(data)
-    return redirect(url_for('employees', message=f'Employee {name} added successfully!'))
+    for _ in range(10):
+        emp_id = f'EMP{next_counter():03d}'
+        if store_create_employee(emp_id, emp):
+            return redirect(url_for('employees', message=f'Employee {name} added successfully!'))
+    return redirect(url_for('employees', message='Could not create the employee, please try again'))
+
+
+@app.route('/set_pin', methods=['POST'])
+@admin_required
+def set_pin():
+    emp_id = request.form.get('emp_id', '')
+    pin = request.form.get('pin', '').strip()
+    emp = store_get_employee(emp_id)
+    if not emp:
+        return redirect(url_for('employees', message='Employee not found'))
+    if not valid_pin(pin):
+        return redirect(url_for('employees', message='PIN must be 4 to 6 digits'))
+    emp['pin_hash'] = generate_password_hash(pin, method='pbkdf2:sha256')
+    emp['fails'] = 0
+    emp['locked_until'] = 0
+    store_set_employee(emp_id, emp)
+    return redirect(url_for('employees', message=f'PIN updated for {emp["name"]}'))
+
 
 @app.route('/delete_employee', methods=['POST'])
+@admin_required
 def delete_employee():
-    data = load_data()
-    emp_id = request.form.get('emp_id')
-
-    
-    if not session.get('is_admin', False):
-        return redirect(url_for('employees', message='Admin login required to delete employees'))
-
-    if emp_id not in data['employees']:
+    emp_id = request.form.get('emp_id', '')
+    if not store_get_employee(emp_id):
         return redirect(url_for('employees', message='Employee not found'))
-
-    del data['employees'][emp_id]
-    data['attendance'] = [r for r in data['attendance'] if r['employee_id'] != emp_id]
-    save_data(data)
+    store_delete_employee(emp_id)
     return redirect(url_for('employees', message=f'Employee {emp_id} deleted'))
 
+
 @app.route('/records')
+@admin_required
 def records():
     data = load_data()
     filter_date = request.args.get('date')
@@ -570,9 +884,71 @@ def records():
             record['hours_worked'] = 'In Progress'
 
     records = list(reversed(records))
-    return render_template_string(RECORDS_TEMPLATE, records=records, filter_date=filter_date, current_month=now_local().strftime('%Y-%m'), is_admin=session.get('is_admin', False))
+    return render_template_string(RECORDS_TEMPLATE, records=records, filter_date=filter_date,
+                                  current_month=now_local().strftime('%Y-%m'),
+                                  message=request.args.get('message'),
+                                  is_admin=session.get('is_admin', False))
+
+
+def render_edit(emp_id, date, clock_in, clock_out, message=None):
+    data = load_data()
+    editing = bool(emp_id and valid_date(date) and store_get_record(date, emp_id))
+    return render_template_string(EDIT_TEMPLATE, employees=data['employees'], editing=editing,
+                                  emp_id=emp_id, date=date, clock_in=clock_in, clock_out=clock_out,
+                                  message=message, is_admin=True)
+
+
+@app.route('/edit_record')
+@admin_required
+def edit_record():
+    emp_id = request.args.get('emp_id', '')
+    date = request.args.get('date', '')
+    rec = store_get_record(date, emp_id) if (emp_id and valid_date(date)) else None
+    return render_edit(emp_id, date or now_local().strftime('%Y-%m-%d'),
+                       (rec or {}).get('clock_in') or '', (rec or {}).get('clock_out') or '')
+
+
+@app.route('/save_record', methods=['POST'])
+@admin_required
+def save_record():
+    emp_id = request.form.get('emp_id', '')
+    date = request.form.get('date', '')
+    ci_raw = request.form.get('clock_in', '')
+    co_raw = request.form.get('clock_out', '')
+    emp = store_get_employee(emp_id) if emp_id else None
+    ci = parse_time(ci_raw)
+    co = parse_time(co_raw) if co_raw.strip() else None
+
+    err = None
+    if not emp:
+        err = 'Please choose an employee.'
+    elif not valid_date(date):
+        err = 'Please enter a valid date.'
+    elif not ci:
+        err = 'Please enter a valid clock-in time.'
+    elif co_raw.strip() and not co:
+        err = 'Please enter a valid clock-out time.'
+    elif co and hours_between(date, ci, co) is None:
+        err = 'Clock-out must be later than clock-in.'
+    if err:
+        return render_edit(emp_id, date, ci_raw, co_raw, err)
+
+    rec = store_get_record(date, emp_id) or {}
+    rec.update({'employee_id': emp_id, 'employee_name': emp['name'], 'department': emp['department'],
+                'date': date, 'clock_in': ci, 'clock_out': co})
+    store_set_record(rec)
+    return redirect(url_for('records', message=f'Record saved for {emp["name"]} on {date}'))
+
+
+@app.route('/delete_record', methods=['POST'])
+@admin_required
+def delete_record():
+    store_delete_record(request.form.get('date', ''), request.form.get('emp_id', ''))
+    return redirect(url_for('records', message='Record deleted'))
+
 
 @app.route('/reports')
+@admin_required
 def reports():
     data = load_data()
     week_ago_dt = now_local() - timedelta(days=7)
@@ -817,6 +1193,7 @@ def build_excel(rows, filter_date, month=None, report_title='Attendance Sheet'):
 
 
 @app.route('/export')
+@admin_required
 def export_file():
     data = load_data()
     filter_date = request.args.get('date')
@@ -874,7 +1251,7 @@ def health():
     info = {'redis_configured': bool(REDIS_URL and REDIS_TOKEN)}
     if REDIS_URL and REDIS_TOKEN:
         try:
-            info['redis_ping'] = _redis('ping').get('result')
+            info['redis_ping'] = _cmd('PING')
         except Exception as e:
             info['redis_error'] = str(e)
     return jsonify(info)
